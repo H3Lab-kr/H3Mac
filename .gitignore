@@ -44,6 +44,7 @@ __pycache__/
 *.bak
 lib/opt/bench/flash_bench
 lib/opt/bench/sdpa_bench
+lib/opt/bench/quant_bench
 
 # ==============================================================================
 # OS 아티팩트

@@ -1,0 +1,32 @@
+라벨	환경변수
+base-1	
+nax-mlp	H3_NAX=mlp
+nax-attn	H3_NAX=attn
+nax-qkv	H3_NAX=qkv
+nax-all	H3_NAX=all
+base-2	
+mps-gqa	H3_MPS_GQA=1
+zerocopy-on	H3_ZERO_COPY_WEIGHTS=1
+zerocopy-off	H3_ZERO_COPY_WEIGHTS=0
+int8-fc1-local	H3_INT8_FC1_LOCAL=1
+int8-fc1-known	H3_INT8_FC1_KNOWN=1
+base-3	
+int8-vecquant	H3_INT8_VECTOR_QUANT=1
+int8-gq128	H3_INT8_GROUP_QUANT_128=1
+int8-gq128-cache	H3_INT8_GROUP_QUANT_128_CACHE=1
+fc2-local128	H3_INT8_GROUP_FC2_LOCAL128=1
+fc2-threadgroup	H3_INT8_GROUP_FC2_THREADGROUP=1
+base-4	
+nax-splitrows	H3_NAX_SPLIT_ROWS=1
+cmdblocks-2	H3_DIT_COMMAND_BLOCKS=2
+cmdblocks-4	H3_DIT_COMMAND_BLOCKS=4
+cmdblocks-8	H3_DIT_COMMAND_BLOCKS=8
+cmdblocks-16	H3_DIT_COMMAND_BLOCKS=16
+base-5	
+reuse-mps-on	H3_REUSE_MPS_COMMAND=1
+reuse-mps-off	H3_REUSE_MPS_COMMAND=0
+int8-mlp-stage	H3_INT8_MLP_STAGE=1
+int8-clip	H3_INT8_ACTIVATION_CLIP=1
+qwen-prefetch-16	H3_QWEN_PREFETCH_DEPTH=16
+scalar-patch	H3_SCALAR_PATCH=1
+base-6	

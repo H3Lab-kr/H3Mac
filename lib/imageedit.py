@@ -42,11 +42,16 @@ def edit(hero, prompt, model, raw_out):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("hero"); ap.add_argument("out"); ap.add_argument("prompt_file")
-    ap.add_argument("--w", type=int, default=512); ap.add_argument("--h", type=int, default=896)
-    ap.add_argument("--model", default="gpt-image-1-mini")
-    ap.add_argument("--landscape", action="store_true", help="1536x1024 가로 생성")
+    ap.add_argument("--w", type=int, default=1024); ap.add_argument("--h", type=int, default=576)
+    ap.add_argument("--model", default="gpt-image-2-mini")
+    ap.add_argument("--landscape", action="store_true", default=True, help="1536x1024 가로 생성 (기본값)")
+    ap.add_argument("--portrait", action="store_true", help="1024x1536 세로 생성")
     a = ap.parse_args()
-    if a.landscape:
+    if a.portrait:
+        globals()["GEN_W"], globals()["GEN_H"] = 1024, 1536
+        if a.w == 1024 and a.h == 576:
+            a.w, a.h = 576, 1024
+    else:
         globals()["GEN_W"], globals()["GEN_H"] = 1536, 1024
     out = pathlib.Path(a.out); out.parent.mkdir(parents=True, exist_ok=True)
     raw = out.with_name(out.stem + "_raw.png")

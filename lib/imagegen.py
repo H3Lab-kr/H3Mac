@@ -21,8 +21,10 @@ def load_key():
                 return line.split("=", 1)[1].strip().strip('"').strip("'")
     raise SystemExit("OPENAI_API_KEY 환경변수 또는 .env 파일이 필요합니다.")
 
-def generate(prompt, model, raw_path):
+def generate(prompt, model, raw_path, quality="standard"):
     body = {"model": model, "prompt": prompt, "size": f"{GEN_W}x{GEN_H}", "n": 1}
+    if quality:
+        body["quality"] = quality
     req = urllib.request.Request(
         "https://api.openai.com/v1/images/generations",
         data=json.dumps(body).encode(),
@@ -52,11 +54,17 @@ def fit(raw_path, out_path, w, h):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("out"); ap.add_argument("prompt_file")
-    ap.add_argument("--w", type=int, default=512); ap.add_argument("--h", type=int, default=896)
-    ap.add_argument("--model", default="gpt-image-1-mini")
-    ap.add_argument("--landscape", action="store_true", help="1536x1024 가로 생성")
+    ap.add_argument("--w", type=int, default=1024); ap.add_argument("--h", type=int, default=576)
+    ap.add_argument("--model", default="gpt-image-2-mini", help="이미지 모델 (기본: gpt-image-2-mini)")
+    ap.add_argument("--quality", default="standard", help="화질 (standard, low)")
+    ap.add_argument("--landscape", action="store_true", default=True, help="1536x1024 가로 생성 (기본값)")
+    ap.add_argument("--portrait", action="store_true", help="1024x1536 세로 생성")
     a = ap.parse_args()
-    if a.landscape:
+    if a.portrait:
+        globals()["GEN_W"], globals()["GEN_H"] = 1024, 1536
+        if a.w == 1024 and a.h == 576:
+            a.w, a.h = 576, 1024
+    else:
         globals()["GEN_W"], globals()["GEN_H"] = 1536, 1024
 
     out = pathlib.Path(a.out); out.parent.mkdir(parents=True, exist_ok=True)

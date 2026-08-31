@@ -295,6 +295,7 @@ lib/opt/driver.sh · trial.sh · report.sh
 
 ---
 
-## 기술 문의 및 협업
+## 문의 및 협업 (Contact)
 
-H3Lab 최적화 엔진, 사내 프로덕션 파이프라인 구축 및 기술 문의: [hi@h3lab.kr](mailto:hi@h3lab.kr)
+- **기술 문의 및 최적화 파트너십**: [hi@h3lab.kr](mailto:hi@h3lab.kr)
+- **공식 웹사이트**: [https://h3lab.kr](https://h3lab.kr)

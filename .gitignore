@@ -32,6 +32,7 @@ venv/
 cache/
 out/
 *.mp4
+!assets/samples/*.mp4
 *.ppm
 *.wav
 *.log

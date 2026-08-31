@@ -39,6 +39,9 @@
 @property(nonatomic, strong) MPSGraphTensor *output;
 @property(nonatomic, strong) NSArray<NSNumber *> *inputShape;
 @property(nonatomic, strong) NSArray<NSNumber *> *outputShape;
+/* 한 번만 컴파일해 두는 실행체. 매 인코드마다 그래프를 다시 낮추지 않는다. */
+@property(nonatomic, strong) MPSGraphExecutable *executable;
+@property(nonatomic, strong) NSArray<MPSGraphTensor *> *feedOrder;
 @end
 @implementation H3SDPA
 @end
@@ -65,6 +68,9 @@
 @property(nonatomic, strong) NSArray<NSNumber *> *weightShape;
 @property(nonatomic, strong) NSArray<NSNumber *> *biasShape;
 @property(nonatomic, strong) NSArray<NSNumber *> *outputShape;
+/* 한 번만 컴파일해 두는 실행체. 매 인코드마다 그래프를 다시 낮추지 않는다. */
+@property(nonatomic, strong) MPSGraphExecutable *executable;
+@property(nonatomic, strong) NSArray<MPSGraphTensor *> *feedOrder;
 @end
 @implementation H3Linear
 @end
@@ -79,6 +85,9 @@
 @property(nonatomic, strong) NSArray<NSNumber *> *fc1Shape;
 @property(nonatomic, strong) NSArray<NSNumber *> *fc2Shape;
 @property(nonatomic, strong) NSArray<NSNumber *> *outputShape;
+/* 한 번만 컴파일해 두는 실행체. 매 인코드마다 그래프를 다시 낮추지 않는다. */
+@property(nonatomic, strong) MPSGraphExecutable *executable;
+@property(nonatomic, strong) NSArray<MPSGraphTensor *> *feedOrder;
 @end
 @implementation H3MLP
 @end
@@ -93,6 +102,9 @@
 @property(nonatomic, strong) NSArray<NSNumber *> *weightShape;
 @property(nonatomic, strong) NSArray<NSNumber *> *biasShape;
 @property(nonatomic, strong) NSArray<NSNumber *> *outputShape;
+/* 한 번만 컴파일해 두는 실행체. 매 인코드마다 그래프를 다시 낮추지 않는다. */
+@property(nonatomic, strong) MPSGraphExecutable *executable;
+@property(nonatomic, strong) NSArray<MPSGraphTensor *> *feedOrder;
 @end
 @implementation H3Conv
 @end
@@ -1706,6 +1718,25 @@ static H3SDPA *h3_gpu_window_graph(H3GPU *gpu, uint32_t rows,
         result.query = q; result.key = k; result.value = v; result.output = out;
         result.inputShape = shape;
         result.outputShape = shape;
+        if (!getenv("H3_DISABLE_SPARSE_EXECUTABLE")) {
+            MPSGraphShapedType *st = [[MPSGraphShapedType alloc]
+                initWithShape:shape dataType:MPSDataTypeBFloat16];
+            NSDictionary *feeds = @{q: st, k: st, v: st};
+            MPSGraphCompilationDescriptor *desc =
+                [[MPSGraphCompilationDescriptor alloc] init];
+            @try {
+                MPSGraphExecutable *exe = [graph
+                    compileWithDevice:[MPSGraphDevice deviceWithMTLDevice:gpu.device]
+                                feeds:feeds targetTensors:@[out]
+                     targetOperations:nil compilationDescriptor:desc];
+                if (exe && exe.feedTensors.count == 3) {
+                    result.executable = exe;
+                    result.feedOrder = exe.feedTensors;
+                }
+            } @catch (NSException *exception) {
+                /* 컴파일이 안 되면 기존 인코드 경로로 조용히 물러난다 */
+            }
+        }
         gpu.sdpaCache[cacheKey] = result;
         return result;
     }
@@ -1735,21 +1766,31 @@ int h3_gpu_sdpa_window_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     if (!cache) return 0;
     @autoreleasepool {
         MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
-        NSDictionary *feeds = @{
-            cache.query: h3_gpu_graph_data(query, cache.inputShape,
-                                           MPSDataTypeBFloat16, 0),
-            cache.key: h3_gpu_graph_data(key, cache.inputShape,
-                                         MPSDataTypeBFloat16, 0),
-            cache.value: h3_gpu_graph_data(value, cache.inputShape,
-                                           MPSDataTypeBFloat16, 0)
-        };
+        MPSGraphTensorData *qd = h3_gpu_graph_data(query, cache.inputShape,
+                                                   MPSDataTypeBFloat16, 0);
+        MPSGraphTensorData *kd = h3_gpu_graph_data(key, cache.inputShape,
+                                                   MPSDataTypeBFloat16, 0);
+        MPSGraphTensorData *vd = h3_gpu_graph_data(value, cache.inputShape,
+                                                   MPSDataTypeBFloat16, 0);
         MPSGraphTensorData *outputData = h3_gpu_graph_data(
             output, cache.outputShape, MPSDataTypeBFloat16, 0);
         @try {
-            [cache.graph encodeToCommandBuffer:command feeds:feeds
-                              targetOperations:nil
-                             resultsDictionary:@{cache.output: outputData}
-                           executionDescriptor:nil];
+            if (cache.executable) {
+                NSMutableArray *inputs = [NSMutableArray arrayWithCapacity:3];
+                for (MPSGraphTensor *t in cache.feedOrder)
+                    [inputs addObject:t == cache.query ? qd :
+                                       t == cache.key ? kd : vd];
+                [cache.executable encodeToCommandBuffer:command
+                                           inputsArray:inputs
+                                          resultsArray:@[outputData]
+                                   executionDescriptor:nil];
+            } else {
+                [cache.graph encodeToCommandBuffer:command
+                    feeds:@{cache.query: qd, cache.key: kd, cache.value: vd}
+                    targetOperations:nil
+                    resultsDictionary:@{cache.output: outputData}
+                    executionDescriptor:nil];
+            }
         } @catch (NSException *exception) {
             h3_gpu_set_error(gpu, @"MPSGraph window SDPA failed: %@",
                              exception.reason);

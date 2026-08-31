@@ -14,45 +14,9 @@ Apple Silicon(Mac M-Series) 환경에서 **MiniMax H3  - 33B 멀티모달 비디
 
 H3Lab의 궁극적인 목표는 수천만 원대 엔터프라이즈 GPU 클러스터(2× A100/H100, 256GB RAM)에서나 가능하던 초거대 AI 비디오/오디오 프로덕션 워크플로를 **개인 창작자와 스튜디오의 단일 Apple Silicon 워크스테이션에서 완전하게 구동**할 수 있도록 다운스케일 및 최적화하는 것입니다.
 
-```mermaid
-flowchart LR
-    subgraph S1["1. 아이디어 & 소스"]
-        direction TB
-        A1["스크립트 & 프롬프트"]
-        A2["스토리보드 & 레퍼런스"]
-        A3["히어로 스틸 (DALL-E)"]
-    end
-
-    subgraph S2["2. 컨트롤 유니온"]
-        direction TB
-        B1["Canny / Depth"]
-        B2["OpenPose / HED"]
-        B3["선 감지 / 에지 제어"]
-    end
-
-    subgraph S3["3. 스타일 & LoRA"]
-        direction TB
-        C1["캐릭터 고정 LoRA"]
-        C2["배경 & 무드 스타일"]
-        C3["오프라인 mmap 병합"]
-    end
-
-    subgraph S4["4. H3 코어 엔진"]
-        direction TB
-        D1["bf16 Metal Video VAE"]
-        D2["Turbo 4-Step DiT"]
-        D3["Apple Silicon 통합 메모리"]
-    end
-
-    subgraph S5["5. 마스터링 & 출력"]
-        direction TB
-        E1["FL2VA 릴레이 렌더"]
-        E2["역할별 LUFS 오디오"]
-        E3["ProRes / MP4 출력"]
-    end
-
-    S1 --> S2 --> S3 --> S4 --> S5
-```
+<p align="center">
+  <img src="assets/h3lab_pipeline_diagram.png" alt="H3Lab Modular Production Pipeline" width="100%">
+</p>
 
 ### 핵심 가치 제안
 1. **비용 0원의 무제한 프로덕션**: 초당 과금되는 클라우드 API 종속을 탈피하고, 로컬 Mac 1대에서 고품질 숏폼(30초)을 13분대에 렌더링.
@@ -85,15 +49,9 @@ flowchart LR
 
 ## 3. 엔지니어링 로드맵 (Roadmap)
 
-```mermaid
-flowchart LR
-    P1["Phase 1<br><b>기반 최적화 (완료)</b><br>• bf16 Metal VAE<br>• Turbo 4스텝 병합<br>• FL2VA 릴레이<br>• 오디오 LUFS 정합"]
-    P2["Phase 2<br><b>연산 고도화 (진행중)</b><br>• 희소 윈도우 어텐션<br>• bf16 VAE 인코더<br>• 자동 벤치마크"]
-    P3["Phase 3<br><b>모듈러 제어 (차기)</b><br>• ControlNet Union<br>• Inpainting 커널<br>• 다중 캐릭터 LoRA"]
-    P4["Phase 4<br><b>스튜디오 통합</b><br>• Web / GUI 스튜디오<br>• 실시간 프리뷰<br>• ProRes 4K 마스터링"]
-
-    P1 --> P2 --> P3 --> P4
-```
+<p align="center">
+  <img src="assets/h3lab_roadmap_diagram.png" alt="H3Lab Engineering Roadmap" width="100%">
+</p>
 
 ### Phase 1: 코어 엔진 최적화 및 파이프라인 완성 (현재 릴리즈)
 - [x] Metal 커스텀 bf16 Video VAE 디코더 이식 (3~5배 가속 및 4.8GB 메모리 절감)

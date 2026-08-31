@@ -1632,6 +1632,137 @@ static H3SDPA *h3_gpu_sdpa_cross_graph(H3GPU *gpu, uint32_t q_rows,
     }
 }
 
+
+/* ── 윈도우 어텐션: 전 청크를 그래프 한 장으로 ────────────────────────
+ * int8 QKV 커널은 Q/K/V 를 헤드 우선 [1, heads, rows, dim] 으로 낸다.
+ * 그 레이아웃 그대로 MPSGraph 안에서 잘라 쓰므로 전치도 복사도 없다.
+ * 청크마다 [싱크 전체 | 이웃 프레임 창] 을 K/V 로 삼고, 결과를 이어붙여
+ * 전체 시퀀스 출력을 만든다. 블록·스텝마다 형상이 같으니 그래프는 한 번만 만든다. */
+static H3SDPA *h3_gpu_window_graph(H3GPU *gpu, uint32_t rows,
+                                   uint32_t video_start, uint32_t frames,
+                                   uint32_t spatial, uint32_t radius,
+                                   uint32_t chunk, uint32_t heads,
+                                   uint32_t head_dim, float scale) {
+    @autoreleasepool {
+        NSString *cacheKey = [NSString stringWithFormat:
+            @"win:%u:%u:%u:%u:%u:%u:%u:%u:%.9g", rows, video_start, frames,
+            spatial, radius, chunk, heads, head_dim, scale];
+        H3SDPA *cached = gpu.sdpaCache[cacheKey];
+        if (cached) return cached;
+        MPSGraph *graph = [[MPSGraph alloc] init];
+        NSArray<NSNumber *> *shape = @[@1, @(heads), @(rows), @(head_dim)];
+        MPSGraphTensor *q = [graph placeholderWithShape:shape
+            dataType:MPSDataTypeBFloat16 name:nil];
+        MPSGraphTensor *k = [graph placeholderWithShape:shape
+            dataType:MPSDataTypeBFloat16 name:nil];
+        MPSGraphTensor *v = [graph placeholderWithShape:shape
+            dataType:MPSDataTypeBFloat16 name:nil];
+        if (![graph respondsToSelector:@selector(scaledDotProductAttentionWithQueryTensor:keyTensor:valueTensor:scale:name:)]) {
+            h3_gpu_set_error(gpu, @"native MPSGraph SDPA is unavailable");
+            return nil;
+        }
+        MPSGraphTensor *(^rowSlice)(MPSGraphTensor *, uint32_t, uint32_t) =
+            ^MPSGraphTensor *(MPSGraphTensor *t, uint32_t a, uint32_t b) {
+                return [graph sliceTensor:t dimension:2 start:(NSInteger)a
+                                   length:(NSInteger)(b - a) name:nil];
+            };
+        NSMutableArray<MPSGraphTensor *> *parts = [NSMutableArray array];
+        /* 싱크 쿼리(텍스트·오디오·조건)는 전체를 밀집으로 본다 */
+        if (video_start)
+            [parts addObject:[graph
+                scaledDotProductAttentionWithQueryTensor:rowSlice(q, 0, video_start)
+                keyTensor:k valueTensor:v scale:scale name:nil]];
+        for (uint32_t c0 = 0; c0 < frames; c0 += chunk) {
+            uint32_t c1 = c0 + chunk < frames ? c0 + chunk : frames;
+            uint32_t w0 = c0 > radius ? c0 - radius : 0;
+            uint32_t w1 = c1 + radius < frames ? c1 + radius : frames;
+            uint32_t qa = video_start + c0 * spatial;
+            uint32_t qb = video_start + c1 * spatial;
+            uint32_t wa = video_start + w0 * spatial;
+            uint32_t wb = video_start + w1 * spatial;
+            MPSGraphTensor *kk, *vv;
+            if (wa == video_start) {           /* 싱크와 창이 이어져 있다 */
+                kk = rowSlice(k, 0, wb);
+                vv = rowSlice(v, 0, wb);
+            } else if (video_start) {
+                kk = [graph concatTensors:@[rowSlice(k, 0, video_start),
+                                            rowSlice(k, wa, wb)]
+                                dimension:2 name:nil];
+                vv = [graph concatTensors:@[rowSlice(v, 0, video_start),
+                                            rowSlice(v, wa, wb)]
+                                dimension:2 name:nil];
+            } else {
+                kk = rowSlice(k, wa, wb);
+                vv = rowSlice(v, wa, wb);
+            }
+            [parts addObject:[graph
+                scaledDotProductAttentionWithQueryTensor:rowSlice(q, qa, qb)
+                keyTensor:kk valueTensor:vv scale:scale name:nil]];
+        }
+        MPSGraphTensor *out = parts.count == 1 ? parts[0] :
+            [graph concatTensors:parts dimension:2 name:nil];
+        H3SDPA *result = [[H3SDPA alloc] init];
+        result.graph = graph;
+        result.query = q; result.key = k; result.value = v; result.output = out;
+        result.inputShape = shape;
+        result.outputShape = shape;
+        gpu.sdpaCache[cacheKey] = result;
+        return result;
+    }
+}
+
+int h3_gpu_sdpa_window_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                            const h3_gpu_tensor *query,
+                            const h3_gpu_tensor *key,
+                            const h3_gpu_tensor *value,
+                            uint32_t rows, uint32_t video_start,
+                            uint32_t frames, uint32_t spatial,
+                            uint32_t radius, uint32_t chunk,
+                            uint32_t heads, uint32_t head_dim, float scale) {
+    H3GPU *gpu = GPU(opaque);
+    gpu.headMajorSDPAInputs = NO;
+    size_t count = (size_t)rows * heads * head_dim;
+    if (!rows || !heads || !head_dim || !frames || !spatial || !chunk ||
+        !h3_gpu_require_command(gpu) ||
+        !h3_gpu_require_bf16(gpu, query, count, @"window SDPA query") ||
+        !h3_gpu_require_bf16(gpu, key, count, @"window SDPA key") ||
+        !h3_gpu_require_bf16(gpu, value, count, @"window SDPA value") ||
+        !h3_gpu_require_bf16(gpu, output, count, @"window SDPA output"))
+        return 0;
+    H3SDPA *cache = h3_gpu_window_graph(gpu, rows, video_start, frames,
+                                        spatial, radius, chunk, heads,
+                                        head_dim, scale);
+    if (!cache) return 0;
+    @autoreleasepool {
+        MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
+        NSDictionary *feeds = @{
+            cache.query: h3_gpu_graph_data(query, cache.inputShape,
+                                           MPSDataTypeBFloat16, 0),
+            cache.key: h3_gpu_graph_data(key, cache.inputShape,
+                                         MPSDataTypeBFloat16, 0),
+            cache.value: h3_gpu_graph_data(value, cache.inputShape,
+                                           MPSDataTypeBFloat16, 0)
+        };
+        MPSGraphTensorData *outputData = h3_gpu_graph_data(
+            output, cache.outputShape, MPSDataTypeBFloat16, 0);
+        @try {
+            [cache.graph encodeToCommandBuffer:command feeds:feeds
+                              targetOperations:nil
+                             resultsDictionary:@{cache.output: outputData}
+                           executionDescriptor:nil];
+        } @catch (NSException *exception) {
+            h3_gpu_set_error(gpu, @"MPSGraph window SDPA failed: %@",
+                             exception.reason);
+            return 0;
+        }
+        gpu.command = command.rootCommandBuffer;
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.mps_sdpa_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
 int h3_gpu_sdpa_cross_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                            const h3_gpu_tensor *query,
                            const h3_gpu_tensor *key,

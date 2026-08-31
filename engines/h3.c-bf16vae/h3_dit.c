@@ -167,13 +167,6 @@ struct h3_dit {
     h3_gpu_tensor *key;
     h3_gpu_tensor *value;
     h3_gpu_tensor *attention_heads;
-    /* 희소 윈도우 어텐션 스테이징 (H3_SPARSE_WIN, 지연 할당) */
-    h3_gpu_tensor *sparse_q;
-    h3_gpu_tensor *sparse_k;
-    h3_gpu_tensor *sparse_v;
-    h3_gpu_tensor *sparse_o;
-    size_t sparse_q_rows;
-    size_t sparse_kv_rows;
     h3_gpu_tensor *attention_output;
     h3_gpu_tensor *token_pool_pairs;
     h3_gpu_tensor *token_baseline_indices;
@@ -1909,6 +1902,8 @@ static int sparse_attention_ready(h3_dit *dit, uint32_t rows, int radius) {
     uint32_t spatial = sparse_spatial(dit);
     uint32_t frames = (uint32_t)dit->latent_t;
     if (dit->token_reduction_active) why = "token-reduction";
+    /* Q/K/V 헤드 우선 레이아웃(int8 QKV)에서만 유효하다. 행 우선 경로는 밀집으로 둔다. */
+    else if (!dit->int8_qkv || getenv("H3_DISABLE_INT8_QKV")) why = "row-major-qkv";
     else if (!spatial || !frames || rows <= video_start) why = "geometry";
     /* 이 스테이지의 행 구성이 [싱크 | latent_t × 격자] 와 정확히 맞아야 한다 */
     else if (video_start + (uint64_t)frames * spatial != rows) why = "misaligned";
@@ -1925,71 +1920,19 @@ static int sparse_attention_ready(h3_dit *dit, uint32_t rows, int radius) {
 
 static int run_sparse_attention(h3_dit *dit, uint32_t rows, int radius,
                                 char *error, size_t error_size) {
-    uint32_t video_start = dit->video_target_start;
     uint32_t spatial = sparse_spatial(dit);
-    uint32_t frames = (uint32_t)dit->latent_t;
     uint32_t chunk = (uint32_t)radius;
-    float scale = 1.0f / sqrtf((float)HEAD_DIM);
-    size_t max_q = (size_t)chunk * spatial;
-    size_t max_kv = (size_t)video_start +
-        ((size_t)chunk + 2u * (size_t)radius) * spatial;
-    if (dit->sparse_q_rows < max_q || dit->sparse_kv_rows < max_kv) {
-        free_tensor(&dit->sparse_q); free_tensor(&dit->sparse_k);
-        free_tensor(&dit->sparse_v); free_tensor(&dit->sparse_o);
-        dit->sparse_q = h3_gpu_tensor_new_bf16(dit->gpu, max_q * INNER);
-        dit->sparse_k = h3_gpu_tensor_new_bf16(dit->gpu, max_kv * INNER);
-        dit->sparse_v = h3_gpu_tensor_new_bf16(dit->gpu, max_kv * INNER);
-        dit->sparse_o = h3_gpu_tensor_new_bf16(dit->gpu, max_q * INNER);
-        if (!dit->sparse_q || !dit->sparse_k || !dit->sparse_v ||
-            !dit->sparse_o) {
-            fail(error, error_size, "cannot allocate sparse attention staging");
-            return 0;
-        }
-        dit->sparse_q_rows = max_q;
-        dit->sparse_kv_rows = max_kv;
+    const char *chunk_env = getenv("H3_SPARSE_CHUNK");
+    if (chunk_env && *chunk_env) {
+        int c = atoi(chunk_env);
+        if (c >= 1) chunk = (uint32_t)c;
     }
-#define OP(call, label) do {                                                    \
-    if (!gpu_op(dit, (call), error, error_size, label)) return 0;               \
-} while (0)
-    /* 싱크 쿼리는 밀집: 출력 버퍼 앞부분(행 0..video_start)에 그대로 쓴다 */
-    if (video_start)
-        OP(h3_gpu_sdpa_cross_bf16(dit->gpu, dit->attention_heads,
-            dit->query, dit->key, dit->value,
-            video_start, rows, HEADS, HEAD_DIM, scale),
-           "sparse sink attention");
-    for (uint32_t c0 = 0; c0 < frames; c0 += chunk) {
-        uint32_t c1 = c0 + chunk < frames ? c0 + chunk : frames;
-        uint32_t k0 = c0 > (uint32_t)radius ? c0 - (uint32_t)radius : 0;
-        uint32_t k1 = c1 + (uint32_t)radius < frames ?
-            c1 + (uint32_t)radius : frames;
-        size_t q_rows = (size_t)(c1 - c0) * spatial;
-        size_t win_rows = (size_t)(k1 - k0) * spatial;
-        size_t kv_rows = (size_t)video_start + win_rows;
-        size_t q_off = ((size_t)video_start + (size_t)c0 * spatial) * INNER;
-        size_t w_off = ((size_t)video_start + (size_t)k0 * spatial) * INNER;
-        OP(h3_gpu_copy_bf16(dit->gpu, dit->sparse_q, 0, dit->query, q_off,
-            q_rows * INNER), "sparse Q slice");
-        if (video_start) {
-            OP(h3_gpu_copy_bf16(dit->gpu, dit->sparse_k, 0, dit->key, 0,
-                (size_t)video_start * INNER), "sparse K sink");
-            OP(h3_gpu_copy_bf16(dit->gpu, dit->sparse_v, 0, dit->value, 0,
-                (size_t)video_start * INNER), "sparse V sink");
-        }
-        OP(h3_gpu_copy_bf16(dit->gpu, dit->sparse_k,
-            (size_t)video_start * INNER, dit->key, w_off,
-            win_rows * INNER), "sparse K window");
-        OP(h3_gpu_copy_bf16(dit->gpu, dit->sparse_v,
-            (size_t)video_start * INNER, dit->value, w_off,
-            win_rows * INNER), "sparse V window");
-        OP(h3_gpu_sdpa_cross_bf16(dit->gpu, dit->sparse_o,
-            dit->sparse_q, dit->sparse_k, dit->sparse_v,
-            (uint32_t)q_rows, (uint32_t)kv_rows, HEADS, HEAD_DIM, scale),
-           "sparse window attention");
-        OP(h3_gpu_copy_bf16(dit->gpu, dit->attention_heads, q_off,
-            dit->sparse_o, 0, q_rows * INNER), "sparse output scatter");
-    }
-#undef OP
-    return 1;
+    return gpu_op(dit, h3_gpu_sdpa_window_bf16(
+        dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
+        rows, dit->video_target_start, (uint32_t)dit->latent_t, spatial,
+        (uint32_t)radius, chunk, HEADS, HEAD_DIM,
+        1.0f / sqrtf((float)HEAD_DIM)), error, error_size,
+        "DiT sparse window attention");
 }
 
 /* ── P0 어텐션 프로브 ──────────────────────────────────────────────
@@ -2135,9 +2078,12 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         !getenv("H3_DISABLE_INT8_ATTENTION_OUT");
     int sparse_radius = sparse_window_radius();
     int sparse_active = sparse_radius &&
-        sparse_attention_ready(dit, rows, sparse_radius);
-    int head_major_attention_output = !sparse_active &&
         int8_attention_output &&
+        !dit->use_slower_row_major_attention_output &&
+        !dit->use_slower_uncached_int8_scales &&
+        !getenv("H3_DISABLE_HEAD_MAJOR_ATTENTION_OUTPUT") &&
+        sparse_attention_ready(dit, rows, sparse_radius);
+    int head_major_attention_output = int8_attention_output &&
         !dit->use_slower_row_major_attention_output &&
         !dit->use_slower_uncached_int8_scales &&
         !getenv("H3_DISABLE_HEAD_MAJOR_ATTENTION_OUTPUT");
@@ -3214,10 +3160,6 @@ int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,
 }
 
 void h3_dit_free(h3_dit *dit) {
-    if (dit) {
-        free_tensor(&dit->sparse_q); free_tensor(&dit->sparse_k);
-        free_tensor(&dit->sparse_v); free_tensor(&dit->sparse_o);
-    }
     if (!dit) return;
     int steps = h3_dit_schedule_steps(dit->schedule);
     if (dit->row_maps) for (int step = 0; step < steps; step++)

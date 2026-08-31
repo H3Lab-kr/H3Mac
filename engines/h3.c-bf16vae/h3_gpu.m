@@ -79,11 +79,15 @@
 @property(nonatomic, strong) MPSGraph *graph;
 @property(nonatomic, strong) MPSGraphTensor *input;
 @property(nonatomic, strong) MPSGraphTensor *fc1Weight;
+@property(nonatomic, strong) MPSGraphTensor *fc1Bias;
 @property(nonatomic, strong) MPSGraphTensor *fc2Weight;
+@property(nonatomic, strong) MPSGraphTensor *fc2Bias;
 @property(nonatomic, strong) MPSGraphTensor *output;
 @property(nonatomic, strong) NSArray<NSNumber *> *inputShape;
 @property(nonatomic, strong) NSArray<NSNumber *> *fc1Shape;
+@property(nonatomic, strong) NSArray<NSNumber *> *fc1BiasShape;
 @property(nonatomic, strong) NSArray<NSNumber *> *fc2Shape;
+@property(nonatomic, strong) NSArray<NSNumber *> *fc2BiasShape;
 @property(nonatomic, strong) NSArray<NSNumber *> *outputShape;
 /* 한 번만 컴파일해 두는 실행체. 매 인코드마다 그래프를 다시 낮추지 않는다. */
 @property(nonatomic, strong) MPSGraphExecutable *executable;
@@ -3129,6 +3133,121 @@ int h3_gpu_mlp_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                 executionDescriptor:nil];
         } @catch (NSException *exception) {
             h3_gpu_set_error(gpu, @"MPSGraph MLP failed: %@", exception.reason);
+            return 0;
+        }
+        gpu.command = command.rootCommandBuffer;
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.mps_linear_dispatches += 2;
+    gpu.stats = stats;
+    return 1;
+}
+
+static H3MLP *h3_gpu_mlp_bias_graph(H3GPU *gpu, uint32_t rows,
+                                    uint32_t input_dim, uint32_t hidden_dim,
+                                    uint32_t output_dim, BOOL has_bias) {
+    @autoreleasepool {
+        NSString *key = [NSString stringWithFormat:@"%u:%u:%u:%u:bias%d", rows,
+                         input_dim, hidden_dim, output_dim, (int)has_bias];
+        H3MLP *cached = gpu.mlpCache[key];
+        if (cached) return cached;
+
+        H3MLP *mlp = [[H3MLP alloc] init];
+        mlp.graph = [[MPSGraph alloc] init];
+        mlp.inputShape = @[@1, @(rows), @(input_dim)];
+        mlp.fc1Shape = @[@1, @(hidden_dim * 2), @(input_dim)];
+        mlp.fc2Shape = @[@1, @(output_dim), @(hidden_dim)];
+        mlp.outputShape = @[@1, @(rows), @(output_dim)];
+        mlp.input = [mlp.graph placeholderWithShape:mlp.inputShape
+                                           dataType:MPSDataTypeBFloat16 name:nil];
+        mlp.fc1Weight = [mlp.graph placeholderWithShape:mlp.fc1Shape
+                                               dataType:MPSDataTypeBFloat16 name:nil];
+        mlp.fc2Weight = [mlp.graph placeholderWithShape:mlp.fc2Shape
+                                               dataType:MPSDataTypeBFloat16 name:nil];
+        MPSGraphTensor *fc1Transposed =
+            [mlp.graph transposeTensor:mlp.fc1Weight dimension:1
+                         withDimension:2 name:nil];
+        MPSGraphTensor *fused =
+            [mlp.graph matrixMultiplicationWithPrimaryTensor:mlp.input
+                                             secondaryTensor:fc1Transposed name:nil];
+        if (has_bias) {
+            mlp.fc1BiasShape = @[@1, @1, @(hidden_dim * 2)];
+            mlp.fc1Bias = [mlp.graph placeholderWithShape:mlp.fc1BiasShape
+                                                 dataType:MPSDataTypeBFloat16 name:nil];
+            fused = [mlp.graph additionWithPrimaryTensor:fused
+                                         secondaryTensor:mlp.fc1Bias name:nil];
+        }
+        NSArray<MPSGraphTensor *> *halves =
+            [mlp.graph splitTensor:fused numSplits:2 axis:2 name:nil];
+        MPSGraphTensor *sigmoid = [mlp.graph sigmoidWithTensor:halves[0]
+                                                              name:nil];
+        MPSGraphTensor *silu =
+            [mlp.graph multiplicationWithPrimaryTensor:halves[0]
+                                       secondaryTensor:sigmoid name:nil];
+        MPSGraphTensor *activated =
+            [mlp.graph multiplicationWithPrimaryTensor:silu
+                                       secondaryTensor:halves[1] name:nil];
+        MPSGraphTensor *fc2Transposed =
+            [mlp.graph transposeTensor:mlp.fc2Weight dimension:1
+                         withDimension:2 name:nil];
+        MPSGraphTensor *result =
+            [mlp.graph matrixMultiplicationWithPrimaryTensor:activated
+                                             secondaryTensor:fc2Transposed name:nil];
+        if (has_bias) {
+            mlp.fc2BiasShape = @[@1, @1, @(output_dim)];
+            mlp.fc2Bias = [mlp.graph placeholderWithShape:mlp.fc2BiasShape
+                                                 dataType:MPSDataTypeBFloat16 name:nil];
+            result = [mlp.graph additionWithPrimaryTensor:result
+                                          secondaryTensor:mlp.fc2Bias name:nil];
+        }
+        mlp.output = [mlp.graph castTensor:result
+                                    toType:MPSDataTypeBFloat16 name:nil];
+        gpu.mlpCache[key] = mlp;
+        return mlp;
+    }
+}
+
+int h3_gpu_mlp_bias_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                         const h3_gpu_tensor *input,
+                         const h3_gpu_tensor *fc1_weight,
+                         const h3_gpu_tensor *fc1_bias,
+                         const h3_gpu_tensor *fc2_weight,
+                         const h3_gpu_tensor *fc2_bias, uint32_t rows,
+                         uint32_t input_dim, uint32_t hidden_dim,
+                         uint32_t output_dim) {
+    H3GPU *gpu = GPU(opaque);
+    BOOL has_bias = (fc1_bias != NULL && fc2_bias != NULL);
+    if (!h3_gpu_require_bf16(gpu, input, (size_t)rows * input_dim, @"MLP input") ||
+        !h3_gpu_require_bf16(gpu, fc1_weight, (size_t)hidden_dim * 2 * input_dim, @"MLP fc1 weight") ||
+        (has_bias && !h3_gpu_require_bf16(gpu, fc1_bias, hidden_dim * 2, @"MLP fc1 bias")) ||
+        !h3_gpu_require_bf16(gpu, fc2_weight, (size_t)output_dim * hidden_dim, @"MLP fc2 weight") ||
+        (has_bias && !h3_gpu_require_bf16(gpu, fc2_bias, output_dim, @"MLP fc2 bias")) ||
+        !h3_gpu_require_bf16(gpu, output, (size_t)rows * output_dim, @"MLP output") ||
+        !h3_gpu_require_command(gpu)) return 0;
+    H3MLP *mlp = h3_gpu_mlp_bias_graph(gpu, rows, input_dim, hidden_dim, output_dim, has_bias);
+    if (!mlp) return 0;
+    @autoreleasepool {
+        MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
+        MPSGraphTensorData *inputData = h3_gpu_graph_data(input, mlp.inputShape, MPSDataTypeBFloat16, 0);
+        MPSGraphTensorData *fc1Data = h3_gpu_graph_data(fc1_weight, mlp.fc1Shape, MPSDataTypeBFloat16, 1);
+        MPSGraphTensorData *fc2Data = h3_gpu_graph_data(fc2_weight, mlp.fc2Shape, MPSDataTypeBFloat16, 1);
+        MPSGraphTensorData *outputData = h3_gpu_graph_data(output, mlp.outputShape, MPSDataTypeBFloat16, 0);
+        NSMutableDictionary *feeds = [NSMutableDictionary dictionaryWithDictionary:@{
+            mlp.input: inputData,
+            mlp.fc1Weight: fc1Data,
+            mlp.fc2Weight: fc2Data
+        }];
+        if (has_bias) {
+            feeds[mlp.fc1Bias] = h3_gpu_graph_data(fc1_bias, mlp.fc1BiasShape, MPSDataTypeBFloat16, 1);
+            feeds[mlp.fc2Bias] = h3_gpu_graph_data(fc2_bias, mlp.fc2BiasShape, MPSDataTypeBFloat16, 1);
+        }
+        NSDictionary *results = @{mlp.output: outputData};
+        @try {
+            [mlp.graph encodeToCommandBuffer:command feeds:feeds
+                targetOperations:nil resultsDictionary:results
+                executionDescriptor:nil];
+        } @catch (NSException *exception) {
+            h3_gpu_set_error(gpu, @"MPSGraph Fused MLP with bias failed: %@", exception.reason);
             return 0;
         }
         gpu.command = command.rootCommandBuffer;

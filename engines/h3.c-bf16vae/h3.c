@@ -308,6 +308,116 @@ static int h3_conditioning_cache_load(
     return 1;
 }
 
+static void h3_cond_cache_path(const char *key, char *out, size_t out_size) {
+    uint64_t h = 14695981039346656037ULL;
+    for (const char *p = key; *p; p++) {
+        h ^= (uint8_t)*p;
+        h *= 1099511628211ULL;
+    }
+    const char *cache_dir = getenv("H3_CACHE_DIR");
+    if (!cache_dir) cache_dir = ".cache";
+    mkdir(cache_dir, 0755);
+    char sub[512];
+    snprintf(sub, sizeof(sub), "%s/cond", cache_dir);
+    mkdir(sub, 0755);
+    snprintf(out, out_size, "%s/cond/%016llx.bin", cache_dir, (unsigned long long)h);
+}
+
+static int h3_disk_conditioning_save(
+        const char *key, const h3_text_embedding *text,
+        const float *video, size_t video_elements,
+        const float *audio, size_t audio_elements,
+        const h3_layout_ref *references, size_t reference_count,
+        int conditioned) {
+    if (!key || !text || !text->values) return 0;
+    char path[512];
+    h3_cond_cache_path(key, path, sizeof(path));
+    FILE *f = fopen(path, "wb");
+    if (!f) return 0;
+    uint32_t magic = 0x44433348; /* "H3CD" */
+    uint32_t version = 1;
+    uint64_t tokens = text->tokens;
+    uint64_t width = text->width;
+    uint64_t v_el = video_elements;
+    uint64_t a_el = audio_elements;
+    uint64_t r_cnt = reference_count;
+    int32_t cond = conditioned;
+    fwrite(&magic, sizeof(magic), 1, f);
+    fwrite(&version, sizeof(version), 1, f);
+    fwrite(&tokens, sizeof(tokens), 1, f);
+    fwrite(&width, sizeof(width), 1, f);
+    fwrite(&v_el, sizeof(v_el), 1, f);
+    fwrite(&a_el, sizeof(a_el), 1, f);
+    fwrite(&r_cnt, sizeof(r_cnt), 1, f);
+    fwrite(&cond, sizeof(cond), 1, f);
+    fwrite(text->values, sizeof(uint16_t), tokens * width, f);
+    if (text->tags) fwrite(text->tags, sizeof(uint8_t), tokens, f);
+    if (v_el && video) fwrite(video, sizeof(float), v_el, f);
+    if (a_el && audio) fwrite(audio, sizeof(float), a_el, f);
+    if (r_cnt && references) fwrite(references, sizeof(h3_layout_ref), r_cnt, f);
+    fclose(f);
+    return 1;
+}
+
+static int h3_disk_conditioning_load(
+        const char *key, h3_text_embedding *text,
+        float **video, size_t *video_elements,
+        float **audio, size_t *audio_elements,
+        h3_layout_ref **references, size_t *reference_count,
+        int *conditioned) {
+    if (!key) return 0;
+    char path[512];
+    h3_cond_cache_path(key, path, sizeof(path));
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    uint32_t magic = 0, version = 0;
+    uint64_t tokens = 0, width = 0, v_el = 0, a_el = 0, r_cnt = 0;
+    int32_t cond = 0;
+    if (fread(&magic, sizeof(magic), 1, f) != 1 || magic != 0x44433348 ||
+        fread(&version, sizeof(version), 1, f) != 1 || version != 1 ||
+        fread(&tokens, sizeof(tokens), 1, f) != 1 ||
+        fread(&width, sizeof(width), 1, f) != 1 ||
+        fread(&v_el, sizeof(v_el), 1, f) != 1 ||
+        fread(&a_el, sizeof(a_el), 1, f) != 1 ||
+        fread(&r_cnt, sizeof(r_cnt), 1, f) != 1 ||
+        fread(&cond, sizeof(cond), 1, f) != 1) {
+        fclose(f);
+        return 0;
+    }
+    uint16_t *values = malloc(tokens * width * sizeof(uint16_t));
+    uint8_t *tags = malloc(tokens * sizeof(uint8_t));
+    if (!values || !tags ||
+        fread(values, sizeof(uint16_t), tokens * width, f) != tokens * width ||
+        fread(tags, sizeof(uint8_t), tokens, f) != tokens) {
+        free(values); free(tags); fclose(f);
+        return 0;
+    }
+    text->tokens = tokens;
+    text->width = width;
+    text->values = values;
+    text->tags = tags;
+    memset(&text->gpu_stats, 0, sizeof(text->gpu_stats));
+
+    *video_elements = v_el;
+    *audio_elements = a_el;
+    *reference_count = r_cnt;
+    *conditioned = cond;
+    *video = v_el ? malloc(v_el * sizeof(float)) : NULL;
+    *audio = a_el ? malloc(a_el * sizeof(float)) : NULL;
+    *references = r_cnt ? malloc(r_cnt * sizeof(h3_layout_ref)) : NULL;
+    if ((v_el && (!*video || fread(*video, sizeof(float), v_el, f) != v_el)) ||
+        (a_el && (!*audio || fread(*audio, sizeof(float), a_el, f) != a_el)) ||
+        (r_cnt && (!*references || fread(*references, sizeof(h3_layout_ref), r_cnt, f) != r_cnt))) {
+        free(*video); free(*audio); free(*references);
+        *video = NULL; *audio = NULL; *references = NULL;
+        h3_text_embedding_free(text);
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    return 1;
+}
+
 static void h3_augment_span(float *values, size_t count, uint64_t seed) {
     h3_rng rng;
     h3_rng_seed(&rng, seed);
@@ -966,16 +1076,25 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         free(ctx->dit_key);
         ctx->dit_key = NULL;
     }
-    conditioning_hit = ctx->cache_enabled && ctx->conditioning_key &&
-        !strcmp(ctx->conditioning_key, conditioning_key);
+    size_t cached_reference_count = 0;
+    int disk_hit = 0;
+    if (ctx->cache_enabled && ctx->conditioning_key &&
+        !strcmp(ctx->conditioning_key, conditioning_key)) {
+        conditioning_hit = h3_conditioning_cache_load(
+            ctx, &text, &condition_video_rows, &condition_video_elements,
+            &condition_audio_rows, &condition_audio_elements,
+            &layout_references, &cached_reference_count, &conditioned);
+    } else if (!getenv("H3_DISABLE_DISK_CACHE")) {
+        conditioning_hit = h3_disk_conditioning_load(
+            conditioning_key, &text, &condition_video_rows,
+            &condition_video_elements, &condition_audio_rows,
+            &condition_audio_elements, &layout_references,
+            &cached_reference_count, &conditioned);
+        if (conditioning_hit) disk_hit = 1;
+    }
     char detail[512];
     if (conditioning_hit) {
-        size_t cached_reference_count = 0;
-        if (!h3_conditioning_cache_load(
-                ctx, &text, &condition_video_rows, &condition_video_elements,
-                &condition_audio_rows, &condition_audio_elements,
-                &layout_references, &cached_reference_count, &conditioned) ||
-            cached_reference_count != (ref2va ? params->reference_count : 0)) {
+        if (cached_reference_count != (ref2va ? params->reference_count : 0)) {
             h3_set_error(ctx, "cannot restore cached conditioning");
             goto cleanup;
         }
@@ -984,7 +1103,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             if (params->last_frame)
                 keyframes[keyframe_count++] = temporal.frame_count - 1;
         }
-        fprintf(stderr, "h3: conditioning cache hit\n");
+        fprintf(stderr, "h3: conditioning cache hit%s (skipped 8.3s text/vision encoders)\n",
+                disk_hit ? " (persistent disk)" : "");
     } else {
     if (visual_capacity) {
         condition_pixels = calloc(visual_capacity, sizeof(*condition_pixels));
@@ -1425,6 +1545,14 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         }
     }
     conditioned = visual_count != 0 || condition_audio_elements != 0;
+    if (!getenv("H3_DISABLE_DISK_CACHE")) {
+        h3_disk_conditioning_save(
+            conditioning_key, &text,
+            condition_video_rows, condition_video_elements,
+            condition_audio_rows, condition_audio_elements,
+            layout_references, ref2va ? params->reference_count : 0,
+            conditioned);
+    }
     if (ctx->cache_enabled) {
         if (!h3_conditioning_cache_store(
                 ctx, conditioning_key, &text,

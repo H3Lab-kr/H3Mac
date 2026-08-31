@@ -4,6 +4,7 @@
 
 #include <errno.h>
 #include <math.h>
+#include <mach/mach_time.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -442,8 +443,7 @@ static int allocate_activations(vae_context *vae, char *error,
         F32(qkv, sequence * INNER * 3),
         F32(query, sequence * INNER), F32(key, sequence * INNER),
         F32(value, sequence * INNER), F32(heads, sequence * INNER),
-        F32(branch, sequence * HIDDEN), F32(ff1, sequence * FFN * 2),
-        F32(activated, sequence * FFN),
+        F32(branch, sequence * HIDDEN),
         F32(projected, sequence * OUTPUT_PATCH),
         /* 픽셀 읽기용 f32 스테이징 — 마지막에 한 번만 캐스트한다 */
         (vae->projected_f32 = h3_gpu_tensor_new_f32(vae->gpu, sequence * OUTPUT_PATCH))
@@ -458,12 +458,56 @@ static int allocate_activations(vae_context *vae, char *error,
     return 1;
 }
 
+/* ── VAE 단계별 계측 (H3_VAE_PROBE=1) ────────────────────────────────
+ * 각 연산 뒤에서 커맨드 버퍼를 끊어 GPU 완료까지 기다린 뒤 시간을 누적한다.
+ * 직렬화 때문에 절대값은 부풀지만 **분포**는 정확하다. */
+enum { VAE_PROBE_OPS = 11 };
+static const char *vae_probe_names[VAE_PROBE_OPS] = {
+    "attn norm", "QKV linear", "QK/RoPE", "SDPA", "attn out linear",
+    "attn residual", "MLP norm", "MLP in linear", "SwiGLU",
+    "MLP out linear", "MLP residual"
+};
+static double vae_probe_acc[VAE_PROBE_OPS];
+static double vae_unpack_read = 0.0, vae_unpack_loop = 0.0;
+static long vae_unpack_calls = 0;
+static long vae_probe_calls[VAE_PROBE_OPS];
+static double vae_probe_now(void) {
+    static mach_timebase_info_data_t tb;
+    if (!tb.denom) mach_timebase_info(&tb);
+    return (double)mach_absolute_time() * tb.numer / tb.denom / 1e9;
+}
+static void vae_probe_report(void) {
+    double total = 0.0;
+    for (int i = 0; i < VAE_PROBE_OPS; i++) total += vae_probe_acc[i];
+    if (total <= 0.0) return;
+    fprintf(stderr, "\nh3 vaeprobe: 언패킹 — GPU 다운로드 %.3fs · CPU 루프 %.3fs (호출 %ld)\n",
+            vae_unpack_read, vae_unpack_loop, vae_unpack_calls);
+    fprintf(stderr, "h3 vaeprobe: 단계별 분포 (직렬 실행 합계 %.2fs)\n", total);
+    for (int i = 0; i < VAE_PROBE_OPS; i++)
+        fprintf(stderr, "h3 vaeprobe: %-18s %7.3fs  %5.1f%%  호출 %ld\n",
+                vae_probe_names[i], vae_probe_acc[i],
+                vae_probe_acc[i] / total * 100.0, vae_probe_calls[i]);
+}
+
 static int run_block(vae_context *vae, int index, char *error,
                      size_t error_size) {
     vae_block *weight = &vae->blocks[index];
     uint32_t rows = vae->sequence;
+    static int probe = -1;
+    if (probe < 0) {
+        probe = getenv("H3_VAE_PROBE") ? 1 : 0;
+        if (probe) atexit(vae_probe_report);   /* 경로와 무관하게 출력 */
+    }
+    int op_index = 0;
 #define OP(call, label) do {                                                    \
+    double t0 = probe ? vae_probe_now() : 0.0;                                  \
     if (!gpu_op(vae, (call), error, error_size, label)) return 0;               \
+    if (probe) {                                                                \
+        if (!h3_gpu_submit(vae->gpu) || !h3_gpu_begin(vae->gpu)) return 0;       \
+        vae_probe_acc[op_index] += vae_probe_now() - t0;                        \
+        vae_probe_calls[op_index]++;                                            \
+    }                                                                           \
+    op_index++;                                                                 \
 } while (0)
     OP(h3_gpu_rms_norm_bf16(vae->gpu, vae->norm, vae->hidden, weight->norm1,
         rows, HIDDEN, 1e-5f), "video VAE attention norm");
@@ -481,12 +525,9 @@ static int run_block(vae_context *vae, int index, char *error,
         weight->scale1, rows, HIDDEN), "video VAE attention residual");
     OP(h3_gpu_rms_norm_bf16(vae->gpu, vae->norm, vae->hidden, weight->norm2,
         rows, HIDDEN, 1e-5f), "video VAE MLP norm");
-    OP(h3_gpu_linear_bf16(vae->gpu, vae->ff1, vae->norm, weight->w1,
-        weight->w1_b, rows, HIDDEN, FFN * 2), "video VAE MLP input");
-    OP(h3_gpu_swiglu_bf16(vae->gpu, vae->activated, vae->ff1, rows, FFN),
-       "video VAE SwiGLU");
-    OP(h3_gpu_linear_bf16(vae->gpu, vae->branch, vae->activated, weight->w2,
-        weight->w2_b, rows, FFN, HIDDEN), "video VAE MLP output");
+    OP(h3_gpu_mlp_bias_bf16(vae->gpu, vae->branch, vae->norm, weight->w1,
+        weight->w1_b, weight->w2, weight->w2_b, rows, HIDDEN, FFN, HIDDEN),
+       "video VAE fused MLP");
     OP(h3_gpu_scale_add_bf16(vae->gpu, vae->hidden, vae->hidden, vae->branch,
         weight->scale2, rows, HIDDEN), "video VAE MLP residual");
 #undef OP
@@ -643,11 +684,13 @@ static int unpack_frame_range(vae_context *vae, int first_frame,
         fail(error, error_size, "cannot cast video VAE output to f32");
         return 0;
     }
+    double unpack_t0 = vae_probe_now();
     if (!h3_gpu_tensor_read_f32(vae->projected_f32, rows, projected_count)) {
         free(rows); free(rgb);
         fail(error, error_size, "cannot read video VAE output patches");
         return 0;
     }
+    double unpack_t1 = vae_probe_now();
     static const float mean[] = {0.485f, 0.456f, 0.406f};
     static const float deviation[] = {0.229f, 0.224f, 0.225f};
     for (int output_frame = 0; output_frame < frame_count; output_frame++) {
@@ -681,6 +724,9 @@ static int unpack_frame_range(vae_context *vae, int first_frame,
             }
         }
     }
+    vae_unpack_read += unpack_t1 - unpack_t0;
+    vae_unpack_loop += vae_probe_now() - unpack_t1;
+    vae_unpack_calls++;
     free(rows);
     output->frames = frame_count;
     output->height = pixel_h;

@@ -2394,6 +2394,26 @@ static int run_block(h3_dit *dit, unsigned index, int step,
     return 1;
 }
 
+/* ── TeaCache-Lite: 특정 스텝에서 변화가 작은 중간 블록(예: 10~24) 건너뛰기 ── */
+static int should_skip_block(int step, unsigned block) {
+    static int initialized = 0;
+    static int skip_min = -1, skip_max = -1, min_step = 2;
+    if (!initialized) {
+        initialized = 1;
+        const char *range = getenv("H3_BLOCK_SKIP_RANGE");
+        const char *steps_env = getenv("H3_BLOCK_SKIP_MIN_STEP");
+        if (range && sscanf(range, "%d-%d", &skip_min, &skip_max) == 2) {
+            if (steps_env) min_step = atoi(steps_env);
+            fprintf(stderr, "h3: TeaCache-Lite 활성화 - 스텝 >= %d 구간에서 블록 %d~%d 건너뜀\n",
+                    min_step, skip_min, skip_max);
+        }
+    }
+    if (skip_min >= 0 && step >= min_step && (int)block >= skip_min && (int)block <= skip_max) {
+        return 1;
+    }
+    return 0;
+}
+
 static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                           int disable_command_split, char *error,
                           size_t error_size) {
@@ -2553,7 +2573,11 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 } else if (!leave_token_reduction(
                                dit, error, error_size)) return 0;
             }
-            if (!dit->block_active[block]) continue;
+            if (!dit->block_active[block] || should_skip_block(step, block)) {
+                carried_attention_adaln = 0;
+                carried_attention_input_quantized = 0;
+                continue;
+            }
             unsigned next_block = block + 1;
             int next_is_token_boundary = use_token_reduction &&
                 (next_block == dit->token_reduction_begin ||
@@ -2561,7 +2585,9 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
             int fuse_next_attention =
                 !getenv("H3_DISABLE_FUSED_CROSS_BLOCK_ADALN") &&
                 next_block < H3_DIT_BLOCKS &&
-                dit->block_active[next_block] && !next_is_token_boundary;
+                dit->block_active[next_block] &&
+                !should_skip_block(step, next_block) &&
+                !next_is_token_boundary;
             h3_dit_block streamed_weight;
             h3_dit_block *weight = &dit->blocks[block];
             h3_dit_stream_job stream_job;

@@ -167,6 +167,16 @@ struct h3_dit {
     h3_gpu_tensor *key;
     h3_gpu_tensor *value;
     h3_gpu_tensor *attention_heads;
+    /* 희소 윈도우 v3 스테이징 (지연 할당) */
+    h3_gpu_tensor *sparse_q;
+    h3_gpu_tensor *sparse_k;
+    h3_gpu_tensor *sparse_v;
+    h3_gpu_tensor *sparse_o;
+    h3_gpu_tensor *sparse_qs;
+    h3_gpu_tensor *sparse_os;
+    size_t sparse_cap_q;
+    size_t sparse_cap_kv;
+    size_t sparse_cap_s;
     h3_gpu_tensor *attention_output;
     h3_gpu_tensor *token_pool_pairs;
     h3_gpu_tensor *token_baseline_indices;
@@ -1889,6 +1899,24 @@ static int sparse_window_radius(void) {
     return r >= 1 && r <= 16 ? r : 0;
 }
 
+/* 블록별 차등 반경 (H3_SPARSE_WIN_MAP="25-29:2,45-49:2").
+ * 어텐션 질량 프로브에서 국소성이 높게 나온 블록만 창을 좁힌다.
+ * 지정 밖 블록은 기본 반경을 쓴다. */
+static int sparse_block_radius(unsigned block, int base) {
+    const char *m = getenv("H3_SPARSE_WIN_MAP");
+    if (!m || !*m) return base;
+    while (*m) {
+        int a = 0, b = 0, r = 0;
+        if (sscanf(m, "%d-%d:%d", &a, &b, &r) == 3 &&
+            r >= 1 && r <= 16 &&
+            (int)block >= a && (int)block <= b) return r;
+        const char *next = strchr(m, ',');
+        if (!next) break;
+        m = next + 1;
+    }
+    return base;
+}
+
 /* 격자 = (latent_h/2)×(latent_w/2), 프레임 = latent_t.
  * 토큰 감축 검증부(h3_dit.c 상단)가 쓰는 것과 같은 식이다. */
 static uint32_t sparse_spatial(const h3_dit *dit) {
@@ -1918,8 +1946,10 @@ static int sparse_attention_ready(h3_dit *dit, uint32_t rows, int radius) {
     return why == NULL;
 }
 
-static int run_sparse_attention(h3_dit *dit, uint32_t rows, int radius,
-                                char *error, size_t error_size) {
+/* v3: 개더 커널 + 순수 배치 SDPA. MPSGraph 에는 플레이스홀더만 준다.
+ * 이전 그래프(슬라이스+연접) 경로는 H3_SPARSE_GRAPH=1 로 남겨둔다. */
+static int run_sparse_attention_graph(h3_dit *dit, uint32_t rows, int radius,
+                                      char *error, size_t error_size) {
     uint32_t spatial = sparse_spatial(dit);
     uint32_t chunk = (uint32_t)radius;
     const char *chunk_env = getenv("H3_SPARSE_CHUNK");
@@ -1932,7 +1962,157 @@ static int run_sparse_attention(h3_dit *dit, uint32_t rows, int radius,
         rows, dit->video_target_start, (uint32_t)dit->latent_t, spatial,
         (uint32_t)radius, chunk, HEADS, HEAD_DIM,
         1.0f / sqrtf((float)HEAD_DIM)), error, error_size,
-        "DiT sparse window attention");
+        "DiT sparse window attention (graph)");
+}
+
+static int run_sparse_attention(h3_dit *dit, uint32_t rows, int radius,
+                                char *error, size_t error_size) {
+    if (getenv("H3_SPARSE_GRAPH"))
+        return run_sparse_attention_graph(dit, rows, radius, error, error_size);
+#define OP(call, label) do {                                                    \
+    if (!gpu_op(dit, (call), error, error_size, label)) return 0;               \
+} while (0)
+    uint32_t S = sparse_spatial(dit);
+    uint32_t F = (uint32_t)dit->latent_t;
+    uint32_t sink = dit->video_target_start;
+    uint32_t r = (uint32_t)radius;
+    uint32_t C = r;
+    const char *chunk_env = getenv("H3_SPARSE_CHUNK");
+    if (chunk_env && *chunk_env) {
+        int c = atoi(chunk_env);
+        if (c >= 1 && (uint32_t)c <= F) C = (uint32_t)c;
+    }
+    uint32_t Lw = C + 2u * r < F ? C + 2u * r : F;   /* 균일 창 길이(프레임) */
+    uint32_t nb = F / C, rem = F % C;
+    if (nb > 64) { /* w0 배열을 setBytes 로 보내는 한도 */
+        C = (F + 63u) / 64u; nb = F / C; rem = F % C;
+        Lw = C + 2u * r < F ? C + 2u * r : F;
+    }
+    float scale = 1.0f / sqrtf((float)HEAD_DIM);
+    /* 스테이징 (지연 할당, 최대 크기로) */
+    size_t q_need = (size_t)nb * C * S * INNER;
+    size_t kv_need = (size_t)nb * (sink + (size_t)Lw * S) * INNER;
+    size_t s_need = (size_t)sink * INNER;
+    if (dit->sparse_cap_q < q_need || dit->sparse_cap_kv < kv_need ||
+        dit->sparse_cap_s < s_need) {
+        free_tensor(&dit->sparse_q); free_tensor(&dit->sparse_k);
+        free_tensor(&dit->sparse_v); free_tensor(&dit->sparse_o);
+        free_tensor(&dit->sparse_qs); free_tensor(&dit->sparse_os);
+        dit->sparse_q = h3_gpu_tensor_new_bf16(dit->gpu, q_need);
+        dit->sparse_k = h3_gpu_tensor_new_bf16(dit->gpu, kv_need);
+        dit->sparse_v = h3_gpu_tensor_new_bf16(dit->gpu, kv_need);
+        dit->sparse_o = h3_gpu_tensor_new_bf16(dit->gpu, q_need);
+        dit->sparse_qs = h3_gpu_tensor_new_bf16(dit->gpu, s_need);
+        dit->sparse_os = h3_gpu_tensor_new_bf16(dit->gpu, s_need);
+        if (!dit->sparse_q || !dit->sparse_k || !dit->sparse_v ||
+            !dit->sparse_o || !dit->sparse_qs || !dit->sparse_os) {
+            fail(error, error_size, "cannot allocate sparse v3 staging");
+            return 0;
+        }
+        dit->sparse_cap_q = q_need;
+        dit->sparse_cap_kv = kv_need;
+        dit->sparse_cap_s = s_need;
+    }
+    uint32_t w0[64], q0[64];
+    /* ① 본 배치: nb 개 청크, 균일 형상 */
+    if (nb) {
+        for (uint32_t b = 0; b < nb; b++) {
+            uint32_t c0 = b * C;
+            uint32_t w0f = c0 > r ? c0 - r : 0;
+            if (w0f + Lw > F) w0f = F - Lw;      /* 가장자리는 안쪽으로 당겨 균일 유지 */
+            w0[b] = sink + w0f * S;
+            q0[b] = sink + c0 * S;
+        }
+        uint32_t nq = C * S, nkv = sink + Lw * S;
+        OP(h3_gpu_window_gather_bf16(dit->gpu, dit->sparse_q, dit->query,
+            q0, nb, nq, 0, HEADS, HEAD_DIM, rows), "sparse v3 Q gather");
+        OP(h3_gpu_window_gather_bf16(dit->gpu, dit->sparse_k, dit->key,
+            w0, nb, nkv, sink, HEADS, HEAD_DIM, rows), "sparse v3 K gather");
+        OP(h3_gpu_window_gather_bf16(dit->gpu, dit->sparse_v, dit->value,
+            w0, nb, nkv, sink, HEADS, HEAD_DIM, rows), "sparse v3 V gather");
+        OP(h3_gpu_sdpa_batch_hm_bf16(dit->gpu, dit->sparse_o,
+            dit->sparse_q, dit->sparse_k, dit->sparse_v,
+            nb, nq, nkv, HEADS, HEAD_DIM, scale), "sparse v3 attention");
+        OP(h3_gpu_window_scatter_bf16(dit->gpu, dit->attention_heads,
+            dit->sparse_o, q0, nb, nq, HEADS, HEAD_DIM, rows),
+           "sparse v3 scatter");
+    }
+    /* ② 나머지 프레임 (F % C) — 단일 청크 */
+    if (rem) {
+        uint32_t c0 = nb * C;
+        uint32_t Lr = rem + 2u * r < F ? rem + 2u * r : F;
+        uint32_t w0f = c0 > r ? c0 - r : 0;
+        if (w0f + Lr > F) w0f = F - Lr;
+        uint32_t rw0 = sink + w0f * S, rq0 = sink + c0 * S;
+        uint32_t nq = rem * S, nkv = sink + Lr * S;
+        OP(h3_gpu_window_gather_bf16(dit->gpu, dit->sparse_q, dit->query,
+            &rq0, 1, nq, 0, HEADS, HEAD_DIM, rows), "sparse v3 rem Q");
+        OP(h3_gpu_window_gather_bf16(dit->gpu, dit->sparse_k, dit->key,
+            &rw0, 1, nkv, sink, HEADS, HEAD_DIM, rows), "sparse v3 rem K");
+        OP(h3_gpu_window_gather_bf16(dit->gpu, dit->sparse_v, dit->value,
+            &rw0, 1, nkv, sink, HEADS, HEAD_DIM, rows), "sparse v3 rem V");
+        OP(h3_gpu_sdpa_batch_hm_bf16(dit->gpu, dit->sparse_o,
+            dit->sparse_q, dit->sparse_k, dit->sparse_v,
+            1, nq, nkv, HEADS, HEAD_DIM, scale), "sparse v3 rem attention");
+        OP(h3_gpu_window_scatter_bf16(dit->gpu, dit->attention_heads,
+            dit->sparse_o, &rq0, 1, nq, HEADS, HEAD_DIM, rows),
+           "sparse v3 rem scatter");
+    }
+    /* ③ 싱크 쿼리(텍스트·오디오·조건)는 전체를 밀집으로 — 오디오는 성역 */
+    if (sink) {
+        uint32_t zero = 0;
+        OP(h3_gpu_window_gather_bf16(dit->gpu, dit->sparse_qs, dit->query,
+            &zero, 1, sink, 0, HEADS, HEAD_DIM, rows), "sparse v3 sink Q");
+        OP(h3_gpu_sdpa_batch_hm_bf16(dit->gpu, dit->sparse_os,
+            dit->sparse_qs, dit->key, dit->value,
+            1, sink, rows, HEADS, HEAD_DIM, scale), "sparse v3 sink attention");
+        OP(h3_gpu_window_scatter_bf16(dit->gpu, dit->attention_heads,
+            dit->sparse_os, &zero, 1, sink, HEADS, HEAD_DIM, rows),
+           "sparse v3 sink scatter");
+    }
+#undef OP
+    return 1;
+}
+
+/* ── 스텝 간 블록 변화량 프로브 (H3_BLOCK_PROBE=1) ──────────────────
+ * 각 (스텝, 블록) 에서 블록이 hidden 을 얼마나 바꾸는지 잰다.
+ *   변화율 = ||출력 - 입력|| / ||입력||   (샘플 행 기준)
+ * 뒤 스텝에서 변화가 작은 블록이 많다면 스텝 간 스킵의 근거가 된다.
+ * 근거 없이 임계값을 정하지 않기 위한 계측이다. */
+static int block_probe_snapshot(h3_dit *dit, float *out, size_t n,
+                                size_t offset) {
+    if (!h3_gpu_submit(dit->gpu)) return 0;
+    uint16_t *raw = malloc((offset + n) * sizeof(*raw));
+    int ok = raw && h3_gpu_tensor_read_bf16(dit->hidden, raw, offset + n);
+    if (ok)
+        for (size_t i = 0; i < n; i++) {
+            uint32_t bits = (uint32_t)raw[offset + i] << 16;
+            float f; memcpy(&f, &bits, sizeof(f));
+            out[i] = f;
+        }
+    free(raw);
+    return ok && h3_gpu_begin(dit->gpu);
+}
+
+static void block_probe_report(unsigned block, int step,
+                               const float *b1, const float *a1, size_t n1,
+                               const float *b2, const float *a2, size_t n2) {
+    double v[2][2] = {{0,0},{0,0}};
+    for (size_t i = 0; i < n1; i++) {
+        double d = (double)a1[i] - b1[i];
+        v[0][0] += d * d; v[0][1] += (double)b1[i] * b1[i];
+    }
+    for (size_t i = 0; i < n2; i++) {
+        double d = (double)a2[i] - b2[i];
+        v[1][0] += d * d; v[1][1] += (double)b2[i] * b2[i];
+    }
+    /* video = 비디오 타깃 영역 (본 관심사) · sink = 텍스트·오디오 조건 영역 */
+    fprintf(stderr,
+        "h3 blockprobe: step=%d block=%u video=%.6f sink=%.6f "
+        "vnorm=%.4g\n", step, block,
+        v[0][1] > 0.0 ? sqrt(v[0][0] / v[0][1]) : 0.0,
+        v[1][1] > 0.0 ? sqrt(v[1][0] / v[1][1]) : 0.0,
+        sqrt(v[0][1] / (double)n1));
 }
 
 /* ── P0 어텐션 프로브 ──────────────────────────────────────────────
@@ -2076,7 +2256,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         attn_probe(dit, index, rows, error, error_size);
     int int8_attention_output = dit->int8_attention_out &&
         !getenv("H3_DISABLE_INT8_ATTENTION_OUT");
-    int sparse_radius = sparse_window_radius();
+    int sparse_radius = sparse_block_radius(index, sparse_window_radius());
     int sparse_active = sparse_radius &&
         int8_attention_output &&
         !dit->use_slower_row_major_attention_output &&
@@ -2423,6 +2603,29 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 }
                 stream_started = 1;
             }
+            static float *pv0, *pv1, *ps0, *ps1;
+            size_t probe_n = 0, probe_sn = 0, probe_off = 0;
+            if (getenv("H3_BLOCK_PROBE")) {
+                /* 비디오 타깃 한복판을 표본으로 — 시퀀스 앞머리는 조건 영역이라
+                 * 그것만 재면 "발화·조건 오염"된 숫자가 나온다. */
+                uint32_t vs = dit->video_target_start;
+                uint32_t vrows = dit->sequence > vs ? dit->sequence - vs : 0;
+                if (vrows > 8) {
+                    probe_n = 8192; probe_sn = vs ? 4096 : 0;
+                    probe_off = ((size_t)vs + vrows / 2u) * HIDDEN;
+                    if (!pv0) {
+                        pv0 = malloc(probe_n * sizeof(*pv0));
+                        pv1 = malloc(probe_n * sizeof(*pv1));
+                        ps0 = malloc(4096 * sizeof(*ps0));
+                        ps1 = malloc(4096 * sizeof(*ps1));
+                    }
+                    if (pv0 && pv1 && ps0 && ps1) {
+                        (void)block_probe_snapshot(dit, pv0, probe_n, probe_off);
+                        if (probe_sn)
+                            (void)block_probe_snapshot(dit, ps0, probe_sn, 0);
+                    } else probe_n = 0;
+                }
+            }
             int block_ok = run_block(
                 dit, block, step, weight, fused_token_adaln,
                 fused_attention_input_quantized,
@@ -2434,6 +2637,11 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 if (stream_started) (void)pthread_join(stream_thread, NULL);
                 return 0;
             }
+            if (probe_n &&
+                block_probe_snapshot(dit, pv1, probe_n, probe_off) &&
+                (!probe_sn || block_probe_snapshot(dit, ps1, probe_sn, 0)))
+                block_probe_report(block, step, pv0, pv1, probe_n,
+                                   ps0, ps1, probe_sn);
             completed_blocks++;
             if (command_blocks &&
                 completed_blocks < dit->active_block_count &&
@@ -3160,6 +3368,11 @@ int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,
 }
 
 void h3_dit_free(h3_dit *dit) {
+    if (dit) {
+        free_tensor(&dit->sparse_q); free_tensor(&dit->sparse_k);
+        free_tensor(&dit->sparse_v); free_tensor(&dit->sparse_o);
+        free_tensor(&dit->sparse_qs); free_tensor(&dit->sparse_os);
+    }
     if (!dit) return;
     int steps = h3_dit_schedule_steps(dit->schedule);
     if (dit->row_maps) for (int step = 0; step < steps; step++)

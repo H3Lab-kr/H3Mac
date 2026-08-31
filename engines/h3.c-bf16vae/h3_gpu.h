@@ -162,6 +162,23 @@ int h3_gpu_qkv_rope_f32(h3_gpu *gpu, h3_gpu_tensor *query,
                         const h3_gpu_tensor *rope_sin, uint32_t sequence,
                         uint32_t heads, uint32_t head_dim,
                         uint32_t rope_half, float epsilon);
+int h3_gpu_sdpa_batch_hm_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                              const h3_gpu_tensor *query,
+                              const h3_gpu_tensor *key,
+                              const h3_gpu_tensor *value,
+                              uint32_t batch, uint32_t q_rows,
+                              uint32_t kv_rows, uint32_t heads,
+                              uint32_t head_dim, float scale);
+int h3_gpu_window_gather_bf16(h3_gpu *gpu, h3_gpu_tensor *dst,
+                              const h3_gpu_tensor *src,
+                              const uint32_t *window_starts, uint32_t batch,
+                              uint32_t n, uint32_t sink, uint32_t heads,
+                              uint32_t dim, uint32_t src_rows);
+int h3_gpu_window_scatter_bf16(h3_gpu *gpu, h3_gpu_tensor *dst,
+                               const h3_gpu_tensor *src,
+                               const uint32_t *dst_starts, uint32_t batch,
+                               uint32_t n, uint32_t heads, uint32_t dim,
+                               uint32_t dst_rows);
 int h3_gpu_sdpa_window_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                             const h3_gpu_tensor *query,
                             const h3_gpu_tensor *key,

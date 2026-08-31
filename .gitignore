@@ -42,6 +42,8 @@ __pycache__/
 *.py[cod]
 *.f32bak
 *.bak
+lib/opt/bench/flash_bench
+lib/opt/bench/sdpa_bench
 
 # ==============================================================================
 # OS 아티팩트

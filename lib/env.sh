@@ -11,11 +11,15 @@ export H3_MODEL_BASE="$ROOT/models/MiniMax-H3"                  # 순정 — 대
 export H3_FFMPEG="$ROOT/bin/ffmpeg"
 export H3_FFPROBE="$ROOT/bin/ffprobe"
 FF="$H3_FFMPEG"; FP="$H3_FFPROBE"; export FF FP
+# 희소 윈도우 어텐션 (V-012): ±4 잠재 프레임 + 싱크 밀집. 긴 클립에서 DiT 2.7배.
+# 짧은 클립·행우선 경로에서는 엔진이 스스로 밀집으로 물러난다. 끄려면 H3_SPARSE_WIN=0.
+export H3_SPARSE_WIN="${H3_SPARSE_WIN:-4}"
+
 # GPU 는 하나뿐이다. 동시 실행은 측정을 오염시킨다.
 h3_lock() {
   LOCKD="$ROOT/.h3.lock.d"
   mkdir "$LOCKD" 2>/dev/null || { echo "이미 실행 중"; return 1; }
   trap 'rmdir "$LOCKD" 2>/dev/null' EXIT INT TERM
-  pgrep -x h3 >/dev/null && { echo "다른 h3 가 GPU 사용 중 — 중단"; return 1; }
+  pgrep -f "(^|/)h3( |$)" >/dev/null && { echo "다른 h3 가 GPU 사용 중 — 중단"; return 1; }
   return 0
 }

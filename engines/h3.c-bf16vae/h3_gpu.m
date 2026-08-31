@@ -424,6 +424,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_video_qkv_rope_f32",
             /* 비디오 VAE bf16 이식 */
             @"h3_scale_add_bf16", @"h3_video_qkv_rope_bf16",
+            @"h3_window_gather_bf16", @"h3_window_scatter_bf16",
             @"h3_adaln_f32", @"h3_gate_f32", @"h3_qkv_rope_f32",
             @"h3_swiglu_f32", @"h3_linear_bf16", @"h3_silu_bf16",
             @"h3_rms_norm_bf16", @"h3_adaln_bf16", @"h3_gate_bf16",
@@ -1645,6 +1646,151 @@ static H3SDPA *h3_gpu_sdpa_cross_graph(H3GPU *gpu, uint32_t q_rows,
 }
 
 
+
+/* ── 윈도우 어텐션 v3 호스트 ──────────────────────────────────────── */
+typedef struct {
+    uint32_t heads, src_rows, dim8, batch, n, sink;
+} h3_window_args_host;
+
+static int h3_gpu_window_move_bf16(H3GPU *gpu, NSString *kernel,
+                                   h3_gpu_tensor *dst,
+                                   const h3_gpu_tensor *src,
+                                   const uint32_t *starts, uint32_t batch,
+                                   uint32_t n, uint32_t sink,
+                                   uint32_t heads, uint32_t dim,
+                                   uint32_t major_rows) {
+    if (!batch || batch > 64 || dim % 8) {
+        h3_gpu_set_error(gpu, @"invalid window move shape");
+        return 0;
+    }
+    size_t moved = (size_t)batch * heads * n * dim;
+    size_t major = (size_t)heads * major_rows * dim;
+    const h3_gpu_tensor *big = [kernel hasSuffix:@"gather_bf16"] ? src :
+        (const h3_gpu_tensor *)dst;
+    const h3_gpu_tensor *small = big == src ? (const h3_gpu_tensor *)dst : src;
+    if (!h3_gpu_require_bf16(gpu, small, moved, @"window move batch") ||
+        !h3_gpu_require_bf16(gpu, big, major, @"window move major")) return 0;
+    h3_window_args_host args = {heads, major_rows, dim / 8, batch, n, sink};
+    size_t bytes = (size_t)batch * sizeof(uint32_t);
+    size_t height = (size_t)batch * heads * n;
+    if (height > UINT32_MAX) { h3_gpu_set_error(gpu, @"window move too large"); return 0; }
+    return h3_gpu_dispatch_2d(gpu, kernel, args.dim8, (uint32_t)height,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(src).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(dst).buffer offset:0 atIndex:1];
+            [encoder setBytes:starts length:bytes atIndex:2];
+            [encoder setBytes:&args length:sizeof(args) atIndex:3];
+        });
+}
+
+/* 순수 플레이스홀더 배치 SDPA: [B,H,Nq,D] × [B,H,Nkv,D] — 전치·슬라이스 없음 */
+static H3SDPA *h3_gpu_sdpa_batch_graph(H3GPU *gpu, uint32_t batch,
+                                       uint32_t q_rows, uint32_t kv_rows,
+                                       uint32_t heads, uint32_t head_dim,
+                                       float scale) {
+    @autoreleasepool {
+        NSString *cacheKey = [NSString stringWithFormat:
+            @"bhm:%u:%u:%u:%u:%u:%.9g", batch, q_rows, kv_rows, heads,
+            head_dim, scale];
+        H3SDPA *cached = gpu.sdpaCache[cacheKey];
+        if (cached) return cached;
+        MPSGraph *graph = [[MPSGraph alloc] init];
+        NSArray<NSNumber *> *qShape = @[@(batch), @(heads), @(q_rows), @(head_dim)];
+        NSArray<NSNumber *> *kvShape = @[@(batch), @(heads), @(kv_rows), @(head_dim)];
+        MPSGraphTensor *q = [graph placeholderWithShape:qShape
+            dataType:MPSDataTypeBFloat16 name:nil];
+        MPSGraphTensor *k = [graph placeholderWithShape:kvShape
+            dataType:MPSDataTypeBFloat16 name:nil];
+        MPSGraphTensor *v = [graph placeholderWithShape:kvShape
+            dataType:MPSDataTypeBFloat16 name:nil];
+        if (![graph respondsToSelector:@selector(scaledDotProductAttentionWithQueryTensor:keyTensor:valueTensor:scale:name:)]) {
+            h3_gpu_set_error(gpu, @"native MPSGraph SDPA is unavailable");
+            return nil;
+        }
+        MPSGraphTensor *att = [graph
+            scaledDotProductAttentionWithQueryTensor:q keyTensor:k
+            valueTensor:v scale:scale name:nil];
+        H3SDPA *result = [[H3SDPA alloc] init];
+        result.graph = graph;
+        result.query = q; result.key = k; result.value = v;
+        result.output = att;
+        result.inputShape = qShape;
+        result.outputShape = qShape;
+        gpu.sdpaCache[cacheKey] = result;
+        return result;
+    }
+}
+
+int h3_gpu_sdpa_batch_hm_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                              const h3_gpu_tensor *query,
+                              const h3_gpu_tensor *key,
+                              const h3_gpu_tensor *value,
+                              uint32_t batch, uint32_t q_rows,
+                              uint32_t kv_rows, uint32_t heads,
+                              uint32_t head_dim, float scale) {
+    H3GPU *gpu = GPU(opaque);
+    gpu.headMajorSDPAInputs = NO;
+    size_t qc = (size_t)batch * heads * q_rows * head_dim;
+    size_t kc = (size_t)batch * heads * kv_rows * head_dim;
+    if (!batch || !q_rows || !kv_rows ||
+        !h3_gpu_require_command(gpu) ||
+        !h3_gpu_require_bf16(gpu, query, qc, @"batch SDPA query") ||
+        !h3_gpu_require_bf16(gpu, key, kc, @"batch SDPA key") ||
+        !h3_gpu_require_bf16(gpu, value, kc, @"batch SDPA value") ||
+        !h3_gpu_require_bf16(gpu, output, qc, @"batch SDPA output"))
+        return 0;
+    H3SDPA *cache = h3_gpu_sdpa_batch_graph(gpu, batch, q_rows, kv_rows,
+                                            heads, head_dim, scale);
+    if (!cache) return 0;
+    @autoreleasepool {
+        MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
+        NSArray<NSNumber *> *kvShape = @[@(batch), @(heads), @(kv_rows),
+                                         @(head_dim)];
+        NSDictionary *feeds = @{
+            cache.query: h3_gpu_graph_data(query, cache.inputShape,
+                                           MPSDataTypeBFloat16, 0),
+            cache.key: h3_gpu_graph_data(key, kvShape, MPSDataTypeBFloat16, 0),
+            cache.value: h3_gpu_graph_data(value, kvShape,
+                                           MPSDataTypeBFloat16, 0)
+        };
+        MPSGraphTensorData *outputData = h3_gpu_graph_data(
+            output, cache.outputShape, MPSDataTypeBFloat16, 0);
+        @try {
+            [cache.graph encodeToCommandBuffer:command feeds:feeds
+                              targetOperations:nil
+                             resultsDictionary:@{cache.output: outputData}
+                           executionDescriptor:nil];
+        } @catch (NSException *exception) {
+            h3_gpu_set_error(gpu, @"MPSGraph batch SDPA failed: %@",
+                             exception.reason);
+            return 0;
+        }
+        gpu.command = command.rootCommandBuffer;
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.mps_sdpa_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
+int h3_gpu_window_gather_bf16(h3_gpu *opaque, h3_gpu_tensor *dst,
+                              const h3_gpu_tensor *src,
+                              const uint32_t *window_starts, uint32_t batch,
+                              uint32_t n, uint32_t sink, uint32_t heads,
+                              uint32_t dim, uint32_t src_rows) {
+    return h3_gpu_window_move_bf16(GPU(opaque), @"h3_window_gather_bf16",
+        dst, src, window_starts, batch, n, sink, heads, dim, src_rows);
+}
+
+int h3_gpu_window_scatter_bf16(h3_gpu *opaque, h3_gpu_tensor *dst,
+                               const h3_gpu_tensor *src,
+                               const uint32_t *dst_starts, uint32_t batch,
+                               uint32_t n, uint32_t heads, uint32_t dim,
+                               uint32_t dst_rows) {
+    return h3_gpu_window_move_bf16(GPU(opaque), @"h3_window_scatter_bf16",
+        dst, src, dst_starts, batch, n, 0, heads, dim, dst_rows);
+}
+
 /* ── 윈도우 어텐션: 전 청크를 그래프 한 장으로 ────────────────────────
  * int8 QKV 커널은 Q/K/V 를 헤드 우선 [1, heads, rows, dim] 으로 낸다.
  * 그 레이아웃 그대로 MPSGraph 안에서 잘라 쓰므로 전치도 복사도 없다.
@@ -1733,6 +1879,9 @@ static H3SDPA *h3_gpu_window_graph(H3GPU *gpu, uint32_t rows,
                     result.executable = exe;
                     result.feedOrder = exe.feedTensors;
                 }
+                fprintf(stderr, "h3: sparse executable %s\n",
+                        result.executable ? "engaged" :
+                        "unavailable (falling back to per-encode graph)");
             } @catch (NSException *exception) {
                 /* 컴파일이 안 되면 기존 인코드 경로로 조용히 물러난다 */
             }

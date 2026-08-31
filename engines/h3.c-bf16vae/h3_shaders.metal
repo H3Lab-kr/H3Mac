@@ -4399,3 +4399,55 @@ kernel void h3_silu_mul_bf16(device const ushort *gate [[buffer(0)]],
     float other = h3_bf16_to_f32(up[gid]);
     output[gid] = h3_f32_to_bf16(value / (1.0f + exp(-value)) * other);
 }
+
+/* ── 윈도우 어텐션 v3: 개더/스캐터 ─────────────────────────────────
+ * MPSGraph 의 슬라이스·연접이 커밋 지연과 중간 텐서 실체화를 만들므로,
+ * K/V 조립을 우리 커널로 하고 SDPA 에는 순수 플레이스홀더만 준다.
+ * 레이아웃: 입력은 헤드 우선 [H][rows][D], 출력도 헤드 우선.
+ * D=128 = uint4(8×bf16) 16개 — x 축이 D/8, 스레드당 16바이트 이동. */
+typedef struct {
+    uint heads;
+    uint src_rows;   /* gather: 원본 행수 / scatter: 목적지 행수 */
+    uint dim8;       /* head_dim / 8 */
+    uint batch;
+    uint n;          /* 배치당 행수 */
+    uint sink;       /* gather 전용: 앞쪽 n<sink 는 원본 행 n 을 그대로 */
+} h3_window_args;
+
+kernel void h3_window_gather_bf16(
+    device const uint4 *src [[buffer(0)]],   /* [H][src_rows][D8] */
+    device uint4 *dst [[buffer(1)]],         /* [B][H][n][D8] */
+    constant uint *w0 [[buffer(2)]],         /* [B] 창 시작 행 (절대) */
+    constant h3_window_args &args [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    uint d = gid.x;
+    if (d >= args.dim8) return;
+    uint idx = gid.y;
+    uint n = idx % args.n;
+    uint t = idx / args.n;
+    uint h = t % args.heads;
+    uint b = t / args.heads;
+    if (b >= args.batch) return;
+    uint srow = n < args.sink ? n : w0[b] + (n - args.sink);
+    dst[(size_t)idx * args.dim8 + d] =
+        src[((size_t)h * args.src_rows + srow) * args.dim8 + d];
+}
+
+kernel void h3_window_scatter_bf16(
+    device const uint4 *src [[buffer(0)]],   /* [B][H][n][D8] */
+    device uint4 *dst [[buffer(1)]],         /* [H][dst_rows][D8] 헤드 우선 */
+    constant uint *q0 [[buffer(2)]],         /* [B] 목적지 시작 행 */
+    constant h3_window_args &args [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    uint d = gid.x;
+    if (d >= args.dim8) return;
+    uint idx = gid.y;
+    uint n = idx % args.n;
+    uint t = idx / args.n;
+    uint h = t % args.heads;
+    uint b = t / args.heads;
+    if (b >= args.batch) return;
+    uint drow = q0[b] + n;
+    dst[((size_t)h * args.src_rows + drow) * args.dim8 + d] =
+        src[(size_t)idx * args.dim8 + d];
+}
